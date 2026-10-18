@@ -5,7 +5,7 @@ A research framework for **unsupervised market-regime detection** on intraday
 stack**. The project compares two regime models — a **Gaussian Hidden Markov
 Model (HMM)** and a **Statistical Jump Model (JM)** — and validates them with
 **Combinatorial Purged Cross-Validation (CPCV)**, the scheme introduced by
-López de Prado to generate multiple, statistically independent backtest paths
+López de Prado to generate multiple complete backtest paths
 from a single time series.
 
 The goal is not a single "best" equity curve, but a reproducible pipeline that
@@ -60,7 +60,7 @@ Regime-factor/
 │   ├── im_model.csv               # combined signal output (factors + positions + PnL)
 │   └── factor_values_norm_im.csv  # large normalized factor matrix + regime labels
 └── market-regime/
-    ├── cpcv.py                    # CPCV framework + HMM / Jump Model helpers
+    ├── cpcv.py                    # Jump Model numerical functions (supports independent segments)
     ├── HMM-regime.ipynb           # Gaussian-HMM pipeline (end to end)
     └── JM-regime.ipynb            # Statistical Jump Model pipeline (end to end)
 ```
@@ -131,7 +131,7 @@ parameter stability. States are re-labelled **by their in-sample realized
 return** so that state ids are comparable across fits.
 
 **2. Statistical Jump Model (SJM)** — implemented from scratch in
-[cpcv.py](file:///d:/Job-project/Regime-factor/market-regime/cpcv.py)
+[cpcv.py](market-regime/cpcv.py)
 
 The JM fits $K$ state centroids $\theta_k$ and a state path $s_t$ by minimizing
 within-state squared error **plus a penalty $\lambda$ for every state change**:
@@ -143,11 +143,11 @@ $$\min_{\{\theta_k\},\, s_{1:T}} \sum_{t=1}^{T} \lVert y_t - \theta_{s_t} \rVert
 - **`fit_sjm`** — coordinate descent: alternate (A) Viterbi path update, (B)
   centroid update as the within-state mean, initialized with KMeans, iterating
   until the path is unchanged.
-- **`predict_test_set`** — out-of-sample inference that warm-starts the DP cost
-  from the last training day, so regime continuity is preserved across the
-  train/test boundary.
-- **`SJMRegimeModel`** — a scikit-learn-style `fit` / `predict` wrapper so the
-  model can be dropped into the CPCV harness.
+- **`predict_test_set`** — causal, per-bar inference. Ordinary train/test
+  calls can pass training costs for a warm start; CPCV omits this context and
+  restarts costs for each independent test segment.
+- All three numerical functions accept `lengths` to identify independent
+  sequences while retaining a shared set of state centers.
 
 Hyper-parameters used: `K = 4`, `λ = 150`, `max_iter = 1000`.
 
@@ -182,44 +182,47 @@ accuracy and a full per-class classification report.
 
 ## Combinatorial Purged Cross-Validation
 
-Standard walk-forward CV yields a single backtest path, which makes it hard to
-tell skill from luck. [cpcv.py](file:///d:/Job-project/Regime-factor/market-regime/cpcv.py)
-implements **CPCV**: the series is cut into $N$ non-overlapping, time-ordered
-groups; every split holds out $k$ groups as test and trains on the rest,
-yielding
+CPCV is written as seven sequential Notebook steps: section **4** of
+`HMM-regime.ipynb` and section **5** of `JM-regime.ipynb`. Run section 1 first
+to prepare `df_min`, then run the CPCV cells in order; the intervening model,
+backtest and data-export sections are not required.
 
-$$\varphi = \binom{N-1}{k-1}$$
+1. Prepare raw features, existing next-bar simple returns (`pct`) and actual
+   return-end timestamps. Drop invalid features and the row without a known
+   next-bar timestamp, retaining original row positions to identify gaps.
+2. Divide the ordered observations into `N` contiguous groups.
+3. Enumerate all `C(N,k)` test-group combinations and remove training events
+   overlapping test event intervals, plus optional purge and embargo buffers.
+4. Inspect the first fold. Fit one global z-score on each fold's training
+   rows and apply the same transform to its training and test data.
+5. Train and predict each fold, respecting independent sequence boundaries.
+   Rank states using training-only cumulative gross returns. HMM test states
+   use causal forward filtering; JM test costs restart after each gap.
+6. Save `data/cpcv_hmm_signals.csv` or `data/cpcv_jm_signals.csv`, then read the
+   signals back and assign each group's successive predictions to paths.
+7. Evaluate every path with explicit positions, turnover fees, additive net
+   values, fixed-capital drawdown and daily-aggregated Sharpe ratios.
 
-**complete** backtest paths. With the configuration used here ($N = 6$, $k = 2$),
-each split trains on 4 groups and holds out 2, producing $\varphi = 5$ paths that
-each cover the whole sample exactly once.
+With `N=6`, `k=2`, this gives **15 model fits** and
+`phi = C(N-1,k-1) = 5` complete paths. Each path contains every eligible row
+exactly once, and each `(split, group)` prediction is used once. Path assembly
+uses per-group occurrence counts, without classes or backtracking. Different
+test groups from one split can enter different paths, so path curves differ
+from the previous implementation. No `N % k == 0` restriction is required.
 
-Key implementation properties:
+`pct` already represents the current row's next-bar return; multiply it by
+the current row's position without another shift. Purging uses closed
+`[row, next row]` event intervals even when extra purge/embargo buffers are zero.
+Training and test scaling now use the same training-only statistics, replacing
+the previous rolling-training/global-test mismatch. Additive drawdown is the
+peak-to-trough net-value difference as a fraction of initial capital.
 
-- **Model-agnostic** — any object exposing `fit(X)` / `fit(X, y)` and
-  `predict(X)` works (HMM, SJM, XGBoost, …). Supervised models are supported via
-  `target_col`.
-- **Purging & embargo** — for every contiguous training block, samples whose
-  label horizon overlaps a test interval (or that fall within `purge_ticks` of
-  it) are purged, and samples within `embargo_ticks` after a test interval are
-  embargoed, all measured in ticks.
-- **No cross-gap leakage** — standardization statistics are computed **per
-  contiguous block**, and rolling windows are reset at block boundaries, so no
-  window ever spans a purged gap or a test region.
-- **Explicit leakage assertions** — `_assert_no_leakage` verifies group
-  membership, purge/embargo correctness, NaN-free features and correct scaling
-  statistics on every split.
-- **Path assignment** — a backtracking search assigns splits to paths so that
-  every group appears exactly once in every path (an internal invariant is
-  asserted per path).
-- **State ranking** — for unsupervised models, `rank_states=True` re-orders raw
-  labels by in-sample realized return so that state `0` is always the worst
-  regime, making state ids consistent across folds.
-
-Common options (all forwarded to `run_cpcv`): `n_groups`, `k_test_groups`,
-`window_size`, `purge_ticks`, `embargo_ticks`, `label_horizon_ticks`,
-`min_train_samples`, `standardize` (`rolling` / `global` / `none`),
-`return_col`, `rank_states`, `target_col`, `group_col`.
+CPCV uses training groups on both sides of held-out periods and measures
+cross-period robustness. It is distinct from a historical-only walk-forward
+simulation, and its paths are not statistically independent. Model parameters,
+features, fees and isolation buffers are directly editable in the input cell.
+The small `cpcv.py` file contains only JM numerical helpers; HMM is imported
+directly from `hmmlearn`.
 
 ---
 
@@ -254,37 +257,10 @@ jupyter notebook HMM-regime.ipynb   # Gaussian-HMM pipeline
 jupyter notebook JM-regime.ipynb    # Jump-Model + XGBoost pipeline
 ```
 
-**CPCV as a library** — one-call helper:
-
-```python
-from cpcv import run_cpcv, SJMRegimeModel
-
-result = run_cpcv(
-    df,                                  # DataFrame with time + feature + return columns
-    feature_cols=['ewma_ret', 'dd20', 'f1', 'f2', 'f4', 'f5'],
-    model_factory=lambda: SJMRegimeModel(n_states=4, lam=150, max_iter=1000),
-    time_col='DateTime',
-    prediction_col='state',
-    n_groups=6, k_test_groups=2,
-    window_size=200,
-    purge_ticks=0, embargo_ticks=0,
-    return_col='pct',                    # rank states by in-sample return
-)
-
-backtest_paths = result['backtest_paths']   # {path_id: DataFrame}
-print(result['phi'])                         # == 5
-```
-
-Or drive the class directly for finer control:
-
-```python
-from cpcv import CPCVGrouped
-
-cpcv = CPCVGrouped(n_groups=6, k_test_groups=2, window_size=200,
-                   purge_ticks=0, embargo_ticks=0, return_col='pct')
-result = cpcv.run(df, feature_cols, model_factory, 'DateTime', 'state')
-paths = cpcv.build_backtest_paths(result)
-```
+**CPCV** — after preparing features in section 1, run the seven CPCV steps
+in the relevant Notebook. Inspect `cpcv_group_summary`, `cpcv_split_summary`,
+`cpcv_train_norm`, `cpcv_state_maps`, `backtest_paths` and `cpcv_metrics` as
+ordinary DataFrames. The old `run_cpcv` / `CPCVGrouped` API has been removed.
 
 ---
 
@@ -311,17 +287,13 @@ Plots generated by each notebook:
 
 ## Design Notes
 
-- **Look-ahead discipline:** next-bar returns, rolling (not global)
-  standardization, and per-block purging are used throughout; the CPCV harness
-  asserts these invariants rather than trusting them.
+- **CPCV time boundaries:** return-event purging, training-only scaling and
+  independent sequence lengths are explicit in the Notebook cells. Test HMM
+  filtering and JM inference use observations only through the current time.
 - **Reproducibility:** fixed random seeds (`42`) for HMM, KMeans initialization.
-- **Separation of concerns:** `cpcv.py` contains **no feature engineering** —
-  the caller prepares the DataFrame, keeping the validation framework reusable
-  and testable. HMM/JM helpers are bundled only for the example notebooks and
-  are not required by the CPCV class itself.
-- **Scalability:** CPCV is model-agnostic by design, so the same harness can
-  benchmark HMM, Jump Model, XGBoost or any other regime model on identical
-  folds.
+- **Visible calculations:** CPCV grouping, standardization, state ranking,
+  signal export and evaluation are written directly in the Notebooks.
+  `cpcv.py` retains only the JM dynamic-programming and fitting functions.
 
 ---
 
